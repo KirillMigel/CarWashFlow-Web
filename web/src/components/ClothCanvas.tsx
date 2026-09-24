@@ -360,14 +360,16 @@ export function ClothCanvas({ velocity, dragging }: Props) {
         let accumulated = 0
         for (let step = anchor + 1; step < NODES; step += 1) {
           const index = base + step * axisStride
-          const depth = depthField[index] - depthField[index - axisStride]
+          const rawDepth = depthField[index] - depthField[index - axisStride]
+          const depth = Math.max(-spacing * 0.72, Math.min(spacing * 0.72, rawDepth))
           accumulated += spacing - Math.sqrt(Math.max(spacingSquared - depth * depth, 0))
           offsetData[index * 2 + component] = -accumulated
         }
         accumulated = 0
         for (let step = anchor - 1; step >= 0; step -= 1) {
           const index = base + step * axisStride
-          const depth = depthField[index] - depthField[index + axisStride]
+          const rawDepth = depthField[index] - depthField[index + axisStride]
+          const depth = Math.max(-spacing * 0.72, Math.min(spacing * 0.72, rawDepth))
           accumulated += spacing - Math.sqrt(Math.max(spacingSquared - depth * depth, 0))
           offsetData[index * 2 + component] = accumulated
         }
@@ -375,8 +377,9 @@ export function ClothCanvas({ velocity, dragging }: Props) {
     }
 
     const composeVertices = (width: number, height: number) => {
-      const amplitude = 24
-      const drape = 22 * (0.3 + 0.7 * gust)
+      const shortSide = Math.min(width, height)
+      const amplitude = Math.max(14, shortSide * 0.09)
+      const drape = shortSide * 0.075 * (0.3 + 0.7 * gust)
       const cellWidth = width / SEGMENTS
       const cellHeight = height / SEGMENTS
 
@@ -437,7 +440,7 @@ export function ClothCanvas({ velocity, dragging }: Props) {
       gl.uniform2f(resolutionLocation, width, height)
       gl.uniform2f(outputLocation, outputWidth, outputHeight)
       gl.uniform1f(bleedLocation, BLEED)
-      gl.uniform1f(focalLocation, 900)
+      gl.uniform1f(focalLocation, 1100)
       gl.uniform1f(lightLocation, 0.62)
       gl.uniform1f(sheenLocation, 0.18)
       gl.drawElements(gl.TRIANGLES, grid.indices.length, gl.UNSIGNED_SHORT, 0)
