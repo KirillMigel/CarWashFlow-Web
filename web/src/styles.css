@@ -7,6 +7,7 @@
   -webkit-font-smoothing: antialiased;
   --surface: #191919;
   --signal: #ffdd2d;
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
 }
 
 * {
@@ -229,7 +230,7 @@ button:focus-visible {
   cursor: grab;
   touch-action: none;
   filter: drop-shadow(0 20px 18px rgba(0, 0, 0, 0.33));
-  transition: filter 140ms ease;
+  transition: filter 140ms var(--ease-out);
 }
 
 .cloth-control.is-dragging {
@@ -237,10 +238,49 @@ button:focus-visible {
   filter: drop-shadow(0 25px 23px rgba(0, 0, 0, 0.43));
 }
 
-.cloth-canvas {
+.cloth-surface,
+.cloth-canvas,
+.cloth-fallback {
   display: block;
   width: 100%;
   height: 100%;
+}
+
+.cloth-surface {
+  position: relative;
+}
+
+.cloth-canvas,
+.cloth-fallback {
+  position: absolute;
+  inset: 0;
+}
+
+.cloth-fallback {
+  object-fit: contain;
+  opacity: 1;
+  transition: opacity 160ms var(--ease-out);
+}
+
+.cloth-canvas {
+  opacity: 0;
+  transition: opacity 160ms var(--ease-out);
+}
+
+.cloth-surface.is-ready .cloth-fallback {
+  opacity: 0;
+}
+
+.cloth-surface.is-ready .cloth-canvas {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cloth-control,
+  .cloth-canvas,
+  .cloth-fallback {
+    transition-duration: 80ms;
+  }
 }
 
 .celebration {
@@ -395,4 +435,3 @@ button:focus-visible {
     transition-duration: 0.01ms !important;
   }
 }
-
