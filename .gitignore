@@ -1,0 +1,10 @@
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
+ios/CarWashWebView/WebApp/
+ios/DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
