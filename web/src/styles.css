@@ -263,6 +263,9 @@ button:focus-visible {
 }
 
 .cloth-canvas {
+  inset: -28px;
+  width: calc(100% + 56px);
+  height: calc(100% + 56px);
   opacity: 0;
   transition: opacity 160ms var(--ease-out);
 }
