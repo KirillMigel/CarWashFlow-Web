@@ -1,48 +1,55 @@
 import { useEffect, useRef, useState } from 'react'
+import { ClothPoint, HoloclothSim } from './holoclothPhysics'
 
 type Props = {
   velocity: { x: number; y: number }
   dragging: boolean
 }
 
-// Physics and fold-lighting adapted from Canvas UI Cloth by David Haz.
-// The html-in-canvas capture was intentionally replaced with a regular PNG texture,
-// so this version works on GitHub Pages and inside an iOS WKWebView without an origin trial.
-const SEGMENTS = 48
-const NODES = SEGMENTS + 1
-const STEP = 1 / 120
-const WAVE_SPEED = 30
-const STIFFNESS = 0.55
-const FORCE_GAIN = 5
-const BLEED = 28
+const SHEET_WIDTH = 1.2
+const SHEET_HEIGHT = 1
+const SEGMENTS_X = 30
+const SEGMENTS_Y = 25
+const COLUMNS = SEGMENTS_X + 1
+const ROWS = SEGMENTS_Y + 1
+const BLEED = 24
 
 const vertexShaderSource = `#version 300 es
 precision highp float;
-layout(location = 0) in vec2 aGrid;
-layout(location = 1) in vec4 aData;
-layout(location = 2) in vec2 aOffset;
 
-uniform vec2 uResolution;
+layout(location = 0) in vec2 aUV;
+layout(location = 1) in vec3 aPosition;
+layout(location = 2) in vec3 aNormal;
+layout(location = 3) in float aCavity;
+
+uniform vec2 uSheet;
+uniform vec2 uSize;
 uniform vec2 uOutput;
 uniform float uBleed;
 uniform float uFocal;
 
 out vec2 vUV;
 out vec3 vNormal;
-out float vFold;
+out float vCavity;
 
 void main() {
-  vUV = aGrid;
-  float z = aData.x;
-  vec2 normalXY = aData.yz;
-  vNormal = vec3(normalXY, sqrt(max(1.0 - dot(normalXY, normalXY), 0.04)));
-  vFold = aData.w;
+  vUV = aUV;
+  vNormal = aNormal;
+  vCavity = aCavity;
 
-  vec2 pixel = aGrid * uResolution + aOffset + vec2(uBleed);
-  vec2 ndc = (pixel / uOutput) * 2.0 - 1.0;
-  ndc.y = -ndc.y;
-  float perspective = (uFocal - z) / uFocal;
-  gl_Position = vec4(ndc, -z / uFocal, perspective);
+  vec2 normalized = vec2(
+    aPosition.x / uSheet.x + 0.5,
+    aPosition.y / uSheet.y + 0.5
+  );
+  float depth = (aPosition.z / uSheet.y) * uSize.y;
+  vec2 center = uSize * 0.5 + vec2(uBleed);
+  vec2 pixel = normalized * uSize + vec2(uBleed);
+  float perspective = uFocal / max(uFocal - depth, 1.0);
+  pixel = center + (pixel - center) * perspective;
+
+  vec2 clip = pixel / uOutput * 2.0 - 1.0;
+  clip.y = -clip.y;
+  gl_Position = vec4(clip, -depth / uFocal, 1.0);
 }
 `
 
@@ -51,34 +58,31 @@ precision highp float;
 
 in vec2 vUV;
 in vec3 vNormal;
-in float vFold;
+in float vCavity;
 
 uniform sampler2D uTexture;
-uniform float uLight;
-uniform float uSheen;
+uniform float uMotion;
 
 out vec4 outColor;
 
 void main() {
-  vec4 textureColor = texture(uTexture, vUV);
-  if (textureColor.a < 0.01) discard;
+  vec4 textile = texture(uTexture, vUV);
+  if (textile.a < 0.015) discard;
 
   vec3 normal = normalize(vNormal);
-  vec3 lightDirection = normalize(vec3(-0.3, 0.42, 0.86));
-  float flatDiffuse = 0.58 + 0.42 * lightDirection.z;
-  float diffuse = 0.58 + 0.42 * dot(normal, lightDirection);
-  float shade = mix(1.0, (diffuse / flatDiffuse) * vFold, uLight);
-  vec3 lit = textureColor.rgb * shade;
+  if (!gl_FrontFacing) normal = -normal;
+  vec3 lightDirection = normalize(vec3(-0.36, -0.42, 0.83));
+  float diffuse = 0.7 + 0.3 * max(dot(normal, lightDirection), 0.0);
+  float cavityShadow = 1.0 - vCavity * 0.22;
 
-  vec3 halfway = normalize(lightDirection + vec3(0.0, 0.0, 1.0));
-  float flatSpecular = pow(halfway.z, 34.0);
-  float specular = max(
-    pow(max(dot(normal, halfway), 0.0), 34.0) - flatSpecular,
-    0.0
-  ) / (1.0 - flatSpecular);
-  lit += uSheen * specular * mix(vec3(1.0), textureColor.rgb, 0.35);
+  vec3 viewDirection = vec3(0.0, 0.0, 1.0);
+  vec3 halfway = normalize(lightDirection + viewDirection);
+  float fiberSheen = pow(max(dot(normal, halfway), 0.0), 18.0);
+  float sheenAmount = 0.035 + 0.035 * uMotion;
 
-  outColor = vec4(clamp(lit, 0.0, 1.0), textureColor.a);
+  vec3 color = textile.rgb * diffuse * cavityShadow;
+  color += fiberSheen * sheenAmount * mix(vec3(1.0), textile.rgb, 0.55);
+  outColor = vec4(clamp(color, 0.0, 1.0), textile.a);
 }
 `
 
@@ -121,40 +125,87 @@ function createProgram(gl: WebGL2RenderingContext) {
 }
 
 function createGrid() {
-  const vertices = new Float32Array(NODES * NODES * 2)
-  for (let row = 0; row < NODES; row += 1) {
-    for (let column = 0; column < NODES; column += 1) {
-      const index = (row * NODES + column) * 2
-      vertices[index] = column / SEGMENTS
-      vertices[index + 1] = row / SEGMENTS
+  const uv = new Float32Array(COLUMNS * ROWS * 2)
+  for (let row = 0; row < ROWS; row += 1) {
+    for (let column = 0; column < COLUMNS; column += 1) {
+      const offset = (row * COLUMNS + column) * 2
+      uv[offset] = column / SEGMENTS_X
+      uv[offset + 1] = row / SEGMENTS_Y
     }
   }
 
-  const indices = new Uint16Array(SEGMENTS * SEGMENTS * 6)
-  let offset = 0
-  for (let row = 0; row < SEGMENTS; row += 1) {
-    for (let column = 0; column < SEGMENTS; column += 1) {
-      const topLeft = row * NODES + column
+  const indices = new Uint16Array(SEGMENTS_X * SEGMENTS_Y * 6)
+  let cursor = 0
+  for (let row = 0; row < SEGMENTS_Y; row += 1) {
+    for (let column = 0; column < SEGMENTS_X; column += 1) {
+      const topLeft = row * COLUMNS + column
       const topRight = topLeft + 1
-      const bottomLeft = topLeft + NODES
+      const bottomLeft = topLeft + COLUMNS
       const bottomRight = bottomLeft + 1
-      indices[offset++] = topLeft
-      indices[offset++] = bottomLeft
-      indices[offset++] = topRight
-      indices[offset++] = topRight
-      indices[offset++] = bottomLeft
-      indices[offset++] = bottomRight
+      indices[cursor++] = topLeft
+      indices[cursor++] = topRight
+      indices[cursor++] = bottomLeft
+      indices[cursor++] = topRight
+      indices[cursor++] = bottomRight
+      indices[cursor++] = bottomLeft
+    }
+  }
+  return { uv, indices }
+}
+
+function computeNormals(
+  positions: Float32Array,
+  indices: Uint16Array,
+  output: Float32Array,
+) {
+  output.fill(0)
+  for (let cursor = 0; cursor < indices.length; cursor += 3) {
+    const a = indices[cursor] * 3
+    const b = indices[cursor + 1] * 3
+    const c = indices[cursor + 2] * 3
+    const abX = positions[b] - positions[a]
+    const abY = positions[b + 1] - positions[a + 1]
+    const abZ = positions[b + 2] - positions[a + 2]
+    const acX = positions[c] - positions[a]
+    const acY = positions[c + 1] - positions[a + 1]
+    const acZ = positions[c + 2] - positions[a + 2]
+    const normalX = abY * acZ - abZ * acY
+    const normalY = abZ * acX - abX * acZ
+    const normalZ = abX * acY - abY * acX
+    for (const offset of [a, b, c]) {
+      output[offset] += normalX
+      output[offset + 1] += normalY
+      output[offset + 2] += normalZ
     }
   }
 
-  return { vertices, indices }
+  for (let offset = 0; offset < output.length; offset += 3) {
+    const inverseLength = 1 / Math.max(Math.hypot(
+      output[offset],
+      output[offset + 1],
+      output[offset + 2],
+    ), 1e-6)
+    output[offset] *= inverseLength
+    output[offset + 1] *= inverseLength
+    output[offset + 2] *= inverseLength
+  }
+}
+
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.min(Math.max(value, minimum), maximum)
 }
 
 export function ClothCanvas({ velocity, dragging }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const motionRef = useRef({ velocity, dragging })
+  const motionRef = useRef({ velocity, dragging, updatedAt: performance.now() })
+  const previousMotionRef = useRef({ velocity, dragging })
   const [ready, setReady] = useState(false)
-  motionRef.current = { velocity, dragging }
+
+  const previousMotion = previousMotionRef.current
+  if (previousMotion.velocity !== velocity || previousMotion.dragging !== dragging) {
+    motionRef.current = { velocity, dragging, updatedAt: performance.now() }
+    previousMotionRef.current = { velocity, dragging }
+  }
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -162,7 +213,7 @@ export function ClothCanvas({ velocity, dragging }: Props) {
 
     const gl = canvas.getContext('webgl2', {
       alpha: true,
-      depth: false,
+      depth: true,
       stencil: false,
       antialias: true,
       premultipliedAlpha: true,
@@ -174,69 +225,53 @@ export function ClothCanvas({ velocity, dragging }: Props) {
     if (!program) return
 
     const grid = createGrid()
+    const simulation = new HoloclothSim(
+      SHEET_WIDTH,
+      SHEET_HEIGHT,
+      SEGMENTS_X,
+      SEGMENTS_Y,
+    )
     const vertexArray = gl.createVertexArray()
-    const gridBuffer = gl.createBuffer()
-    const dataBuffer = gl.createBuffer()
-    const offsetBuffer = gl.createBuffer()
+    const uvBuffer = gl.createBuffer()
+    const vertexBuffer = gl.createBuffer()
     const indexBuffer = gl.createBuffer()
     const texture = gl.createTexture()
-    if (!vertexArray || !gridBuffer || !dataBuffer || !offsetBuffer || !indexBuffer || !texture) {
+    if (!vertexArray || !uvBuffer || !vertexBuffer || !indexBuffer || !texture) {
       gl.deleteProgram(program)
       return
     }
 
-    gl.bindVertexArray(vertexArray)
+    const vertexStride = 7
+    const vertexData = new Float32Array(simulation.count * vertexStride)
+    const normals = new Float32Array(simulation.count * 3)
+    const cavity = new Float32Array(simulation.count)
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, gridBuffer)
-    gl.bufferData(gl.ARRAY_BUFFER, grid.vertices, gl.STATIC_DRAW)
+    gl.bindVertexArray(vertexArray)
+    gl.bindBuffer(gl.ARRAY_BUFFER, uvBuffer)
+    gl.bufferData(gl.ARRAY_BUFFER, grid.uv, gl.STATIC_DRAW)
     gl.enableVertexAttribArray(0)
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, dataBuffer)
-    gl.bufferData(gl.ARRAY_BUFFER, NODES * NODES * 4 * 4, gl.DYNAMIC_DRAW)
+    gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer)
+    gl.bufferData(gl.ARRAY_BUFFER, vertexData.byteLength, gl.DYNAMIC_DRAW)
     gl.enableVertexAttribArray(1)
-    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 0, 0)
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, offsetBuffer)
-    gl.bufferData(gl.ARRAY_BUFFER, NODES * NODES * 2 * 4, gl.DYNAMIC_DRAW)
+    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, vertexStride * 4, 0)
     gl.enableVertexAttribArray(2)
-    gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 0, 0)
+    gl.vertexAttribPointer(2, 3, gl.FLOAT, false, vertexStride * 4, 3 * 4)
+    gl.enableVertexAttribArray(3)
+    gl.vertexAttribPointer(3, 1, gl.FLOAT, false, vertexStride * 4, 6 * 4)
 
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer)
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, grid.indices, gl.STATIC_DRAW)
     gl.bindVertexArray(null)
 
-    const resolutionLocation = gl.getUniformLocation(program, 'uResolution')
+    const sheetLocation = gl.getUniformLocation(program, 'uSheet')
+    const sizeLocation = gl.getUniformLocation(program, 'uSize')
     const outputLocation = gl.getUniformLocation(program, 'uOutput')
     const bleedLocation = gl.getUniformLocation(program, 'uBleed')
     const focalLocation = gl.getUniformLocation(program, 'uFocal')
     const textureLocation = gl.getUniformLocation(program, 'uTexture')
-    const lightLocation = gl.getUniformLocation(program, 'uLight')
-    const sheenLocation = gl.getUniformLocation(program, 'uSheen')
-
-    const heightCurrent = new Float32Array(NODES * NODES)
-    let heightPrevious = new Float32Array(NODES * NODES)
-    let heightNext = new Float32Array(NODES * NODES)
-    const vertexData = new Float32Array(NODES * NODES * 4)
-    const offsetData = new Float32Array(NODES * NODES * 2)
-    const depthField = new Float32Array(NODES * NODES)
-    const rowForce = new Float32Array(NODES)
-    const columnForce = new Float32Array(NODES)
-    const hangCurve = new Float32Array(NODES)
-    for (let index = 0; index < NODES; index += 1) {
-      hangCurve[index] = Math.pow(index / SEGMENTS, 1.3)
-    }
-
-    let current = heightCurrent
-    let simulationTime = Math.random() * 60
-    let gust = 0.55
-    let dragStrength = 0
-    let textureReady = false
-    let didAnnounceReady = false
-    let disposed = false
-    let animationFrame = 0
-    let previousTime = performance.now()
-    let simulationDebt = 0
+    const motionLocation = gl.getUniformLocation(program, 'uMotion')
 
     const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
     let reducedMotion = motionQuery.matches
@@ -245,204 +280,100 @@ export function ClothCanvas({ velocity, dragging }: Props) {
     }
     motionQuery.addEventListener?.('change', handleMotionPreference)
 
+    let textureReady = false
+    let didAnnounceReady = false
+    let disposed = false
+    let animationFrame = 0
+    let previousTime = performance.now()
+    let wasDragging = false
+    let grabOrigin: ClothPoint | null = null
+    let grabTarget: ClothPoint | null = null
+    let motionAmount = 0
+
     const syncCanvasSize = () => {
-      const dpr = Math.min(window.devicePixelRatio || 1, 2)
-      const width = Math.max(1, Math.round(canvas.clientWidth * dpr))
-      const height = Math.max(1, Math.round(canvas.clientHeight * dpr))
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 2)
+      const width = Math.max(1, Math.round(canvas.clientWidth * pixelRatio))
+      const height = Math.max(1, Math.round(canvas.clientHeight * pixelRatio))
       if (canvas.width !== width || canvas.height !== height) {
         canvas.width = width
         canvas.height = height
       }
     }
 
-    const stepSimulation = (delta: number) => {
-      simulationTime += delta * 0.82
-      const wind = FORCE_GAIN * 2.8 * gust
-      const firstWave = (Math.PI * 2) / (SEGMENTS / 1.5)
-      const secondWave = (Math.PI * 2) / (SEGMENTS / 3.8)
-      const crossWave = (Math.PI * 2) / (SEGMENTS / 2.2)
-      const drift = 1.8 * Math.sin(0.23 * simulationTime)
-
-      for (let index = 0; index < NODES; index += 1) {
-        rowForce[index] = Math.sin(
-          firstWave * index - WAVE_SPEED * firstWave * simulationTime + drift,
-        ) + 0.45 * Math.sin(
-          secondWave * index + WAVE_SPEED * secondWave * simulationTime * 0.8 + 3,
-        )
-        columnForce[index] = (
-          0.7 + 0.3 * Math.sin(crossWave * index - 1.7 * simulationTime)
-        ) * hangCurve[index]
-      }
-
-      const speedSquared = WAVE_SPEED * WAVE_SPEED
-      const deltaSquared = delta * delta
-      const decay = Math.exp(-1.18 * delta)
-
-      for (let row = 0; row < NODES; row += 1) {
-        const up = Math.max(row - 1, 0) * NODES
-        const down = Math.min(row + 1, SEGMENTS) * NODES
-        const rowStart = row * NODES
-        for (let column = 0; column < NODES; column += 1) {
-          const index = rowStart + column
-          const left = rowStart + Math.max(column - 1, 0)
-          const right = rowStart + Math.min(column + 1, SEGMENTS)
-          const height = current[index]
-          const laplacian = current[left] + current[right]
-            + current[up + column] + current[down + column] - 4 * height
-          const force = wind * rowForce[column] * columnForce[row]
-          const acceleration = speedSquared * laplacian - STIFFNESS * height + force
-          const next = 2 * height - heightPrevious[index] + deltaSquared * acceleration
-          heightNext[index] = Math.max(-3.5, Math.min(3.5, height + (next - height) * decay))
-        }
-      }
-
-      // The cloth is held along its top edge, matching Canvas UI's pin="top" preset.
-      for (let column = 0; column < NODES; column += 1) {
-        heightNext[column] = 0
-      }
-
-      const spent = heightPrevious
-      heightPrevious = current
-      current = heightNext
-      heightNext = spent
-    }
-
-    const applyDragImpulse = (delta: number, width: number, height: number) => {
+    const updateInteraction = (now: number, delta: number) => {
       const motion = motionRef.current
-      const velocityLength = Math.hypot(motion.velocity.x, motion.velocity.y)
-      const velocityEnergy = Math.min(velocityLength / 20, 1.6)
-      const targetStrength = motion.dragging ? Math.max(0.42, velocityEnergy) : 0
-      const response = motion.dragging ? 8 : 2.5
-      dragStrength += (targetStrength - dragStrength) * Math.min(delta * response, 1)
-      if (dragStrength < 0.01) return
+      if (motion.dragging && !wasDragging) {
+        const centerIndex = Math.floor(ROWS / 2) * COLUMNS + Math.floor(COLUMNS / 2)
+        grabOrigin = simulation.getPoint(centerIndex)
+        grabTarget = { ...grabOrigin }
+        simulation.startGrab(grabOrigin, 0.34)
+      } else if (!motion.dragging && wasDragging) {
+        simulation.endGrab()
+        grabOrigin = null
+        grabTarget = null
+      }
+      wasDragging = motion.dragging
 
-      const cellWidth = width / SEGMENTS
-      const cellHeight = height / SEGMENTS
-      const radius = Math.max(Math.min(width, height) * 0.36, 44)
-      const radiusX = radius / cellWidth
-      const radiusY = radius / cellHeight
-      const centerX = SEGMENTS * 0.5 - Math.max(-1, Math.min(1, motion.velocity.x / 34)) * 4
-      const centerY = SEGMENTS * 0.5 - Math.max(-1, Math.min(1, motion.velocity.y / 34)) * 3
-      const minX = Math.max(Math.ceil(centerX - 2.5 * radiusX), 0)
-      const maxX = Math.min(Math.floor(centerX + 2.5 * radiusX), SEGMENTS)
-      const minY = Math.max(Math.ceil(centerY - 2.5 * radiusY), 1)
-      const maxY = Math.min(Math.floor(centerY + 2.5 * radiusY), SEGMENTS)
-      const lift = (0.75 + velocityEnergy * 1.05) * dragStrength
-      const rate = Math.min(delta * 6, 1)
+      const motionAge = Math.max(0, now - motion.updatedAt)
+      const decay = Math.exp(-Math.max(0, motionAge - 55) / 90)
+      const velocityX = motion.velocity.x * decay
+      const velocityY = motion.velocity.y * decay
+      const speed = Math.hypot(velocityX, velocityY)
+      const targetMotion = motion.dragging ? Math.min(speed / 20, 1) : 0
+      motionAmount += (targetMotion - motionAmount) * Math.min(delta * 10, 1)
 
-      for (let row = minY; row <= maxY; row += 1) {
-        const offsetY = (row - centerY) / radiusY
-        const rowStart = row * NODES
-        for (let column = minX; column <= maxX; column += 1) {
-          const offsetX = (column - centerX) / radiusX
-          const gaussian = Math.exp(-(offsetX * offsetX + offsetY * offsetY))
-          if (gaussian < 0.02) continue
-          const index = rowStart + column
-          const goal = lift * gaussian
-          const pull = rate * gaussian
-          current[index] += (goal - current[index]) * pull
-          heightPrevious[index] += (goal - heightPrevious[index]) * pull * 0.72
+      if (motion.dragging && grabOrigin && grabTarget) {
+        const target: ClothPoint = {
+          x: grabOrigin.x - clamp(velocityX / 80, -0.13, 0.13),
+          y: grabOrigin.y - clamp(velocityY / 90, -0.11, 0.11),
+          z: grabOrigin.z + 0.035 + Math.min(speed / 180, 0.09),
         }
+        const response = Math.min(delta * 13, 1)
+        grabTarget.x += (target.x - grabTarget.x) * response
+        grabTarget.y += (target.y - grabTarget.y) * response
+        grabTarget.z += (target.z - grabTarget.z) * response
+        simulation.moveGrab(grabTarget)
       }
     }
 
-    const foreshorten = (
-      axisStride: number,
-      lineStride: number,
-      spacing: number,
-      anchor: number,
-      component: number,
-    ) => {
-      const spacingSquared = spacing * spacing
-      for (let line = 0; line < NODES; line += 1) {
-        const base = line * lineStride
-        offsetData[(base + anchor * axisStride) * 2 + component] = 0
-        let accumulated = 0
-        for (let step = anchor + 1; step < NODES; step += 1) {
-          const index = base + step * axisStride
-          const rawDepth = depthField[index] - depthField[index - axisStride]
-          const depth = Math.max(-spacing * 0.72, Math.min(spacing * 0.72, rawDepth))
-          accumulated += spacing - Math.sqrt(Math.max(spacingSquared - depth * depth, 0))
-          offsetData[index * 2 + component] = -accumulated
-        }
-        accumulated = 0
-        for (let step = anchor - 1; step >= 0; step -= 1) {
-          const index = base + step * axisStride
-          const rawDepth = depthField[index] - depthField[index + axisStride]
-          const depth = Math.max(-spacing * 0.72, Math.min(spacing * 0.72, rawDepth))
-          accumulated += spacing - Math.sqrt(Math.max(spacingSquared - depth * depth, 0))
-          offsetData[index * 2 + component] = accumulated
-        }
+    const composeVertices = () => {
+      computeNormals(simulation.positions, grid.indices, normals)
+      simulation.computeCavity(normals, cavity)
+      for (let index = 0; index < simulation.count; index += 1) {
+        const input = index * 3
+        const output = index * vertexStride
+        vertexData[output] = simulation.positions[input]
+        vertexData[output + 1] = simulation.positions[input + 1]
+        vertexData[output + 2] = simulation.positions[input + 2]
+        vertexData[output + 3] = normals[input]
+        vertexData[output + 4] = normals[input + 1]
+        vertexData[output + 5] = normals[input + 2]
+        vertexData[output + 6] = cavity[index]
       }
-    }
-
-    const composeVertices = (width: number, height: number) => {
-      const shortSide = Math.min(width, height)
-      const amplitude = Math.max(14, shortSide * 0.09)
-      const drape = shortSide * 0.075 * (0.3 + 0.7 * gust)
-      const cellWidth = width / SEGMENTS
-      const cellHeight = height / SEGMENTS
-
-      for (let row = 0; row < NODES; row += 1) {
-        const rowStart = row * NODES
-        for (let column = 0; column < NODES; column += 1) {
-          const index = rowStart + column
-          depthField[index] = amplitude * Math.tanh(current[index]) + drape * hangCurve[row]
-        }
-      }
-
-      for (let row = 0; row < NODES; row += 1) {
-        const up = Math.max(row - 1, 0) * NODES
-        const down = Math.min(row + 1, SEGMENTS) * NODES
-        const rowStart = row * NODES
-        for (let column = 0; column < NODES; column += 1) {
-          const index = rowStart + column
-          const left = rowStart + Math.max(column - 1, 0)
-          const right = rowStart + Math.min(column + 1, SEGMENTS)
-          const depthX = (depthField[right] - depthField[left]) / (2 * cellWidth)
-          const depthY = (depthField[down + column] - depthField[up + column]) / (2 * cellHeight)
-          const inverseLength = 1 / Math.hypot(depthX, depthY, 1)
-          const curve = depthField[left] + depthField[right]
-            + depthField[up + column] + depthField[down + column] - 4 * depthField[index]
-          const fold = Math.max(0.86, Math.min(1.06, 1 - curve * 0.01))
-          const dataOffset = index * 4
-          vertexData[dataOffset] = depthField[index]
-          vertexData[dataOffset + 1] = -depthX * inverseLength
-          vertexData[dataOffset + 2] = -depthY * inverseLength
-          vertexData[dataOffset + 3] = fold
-        }
-      }
-
-      foreshorten(NODES, 1, cellHeight, 0, 1)
-      foreshorten(1, NODES, cellWidth, SEGMENTS >> 1, 0)
     }
 
     const render = (width: number, height: number) => {
-      const outputWidth = Math.max(canvas.clientWidth, 1)
-      const outputHeight = Math.max(canvas.clientHeight, 1)
-
       gl.viewport(0, 0, canvas.width, canvas.height)
       gl.clearColor(0, 0, 0, 0)
-      gl.clear(gl.COLOR_BUFFER_BIT)
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
       gl.enable(gl.BLEND)
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+      gl.enable(gl.DEPTH_TEST)
+      gl.depthFunc(gl.LEQUAL)
 
       gl.bindVertexArray(vertexArray)
-      gl.bindBuffer(gl.ARRAY_BUFFER, dataBuffer)
+      gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer)
       gl.bufferSubData(gl.ARRAY_BUFFER, 0, vertexData)
-      gl.bindBuffer(gl.ARRAY_BUFFER, offsetBuffer)
-      gl.bufferSubData(gl.ARRAY_BUFFER, 0, offsetData)
-
       gl.useProgram(program)
       gl.activeTexture(gl.TEXTURE0)
       gl.bindTexture(gl.TEXTURE_2D, texture)
       gl.uniform1i(textureLocation, 0)
-      gl.uniform2f(resolutionLocation, width, height)
-      gl.uniform2f(outputLocation, outputWidth, outputHeight)
+      gl.uniform2f(sheetLocation, SHEET_WIDTH, SHEET_HEIGHT)
+      gl.uniform2f(sizeLocation, width, height)
+      gl.uniform2f(outputLocation, canvas.clientWidth, canvas.clientHeight)
       gl.uniform1f(bleedLocation, BLEED)
-      gl.uniform1f(focalLocation, 1100)
-      gl.uniform1f(lightLocation, 0.62)
-      gl.uniform1f(sheenLocation, 0.18)
+      gl.uniform1f(focalLocation, 900)
+      gl.uniform1f(motionLocation, motionAmount)
       gl.drawElements(gl.TRIANGLES, grid.indices.length, gl.UNSIGNED_SHORT, 0)
       gl.bindVertexArray(null)
     }
@@ -456,23 +387,15 @@ export function ClothCanvas({ velocity, dragging }: Props) {
       const height = Math.max(canvas.parentElement?.clientHeight ?? 1, 1)
 
       if (!reducedMotion) {
-        const targetGust = Math.max(
-          0.55
-          + 0.35 * Math.sin(simulationTime * 0.31 + 1.3)
-          + 0.25 * Math.sin(simulationTime * 0.83)
-            * (0.5 + 0.5 * Math.sin(simulationTime * 0.17)),
-          0.15,
-        )
-        gust += (targetGust - gust) * Math.min(delta * 2, 1)
-        applyDragImpulse(delta, width, height)
-        simulationDebt = Math.min(simulationDebt + delta, STEP * 5)
-        while (simulationDebt >= STEP) {
-          stepSimulation(STEP)
-          simulationDebt -= STEP
-        }
+        updateInteraction(now, delta)
+        simulation.step(delta, {
+          viscosity: 0.58,
+          stiffness: 0.96,
+          iterations: 8,
+          smoothing: 0.035,
+        })
       }
-
-      composeVertices(width, height)
+      composeVertices()
       if (textureReady) {
         render(width, height)
         if (!didAnnounceReady) {
@@ -480,7 +403,6 @@ export function ClothCanvas({ velocity, dragging }: Props) {
           setReady(true)
         }
       }
-
       animationFrame = requestAnimationFrame(frame)
     }
 
@@ -490,7 +412,9 @@ export function ClothCanvas({ velocity, dragging }: Props) {
       if (disposed) return
       gl.activeTexture(gl.TEXTURE0)
       gl.bindTexture(gl.TEXTURE_2D, texture)
-      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1)
+      // The simulation grid starts at the visual top-left, so keep the HTML
+      // image row order instead of applying WebGL's conventional Y flip.
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0)
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
@@ -516,9 +440,8 @@ export function ClothCanvas({ velocity, dragging }: Props) {
       motionQuery.removeEventListener?.('change', handleMotionPreference)
       canvas.removeEventListener('webglcontextlost', handleContextLost)
       gl.deleteTexture(texture)
-      gl.deleteBuffer(gridBuffer)
-      gl.deleteBuffer(dataBuffer)
-      gl.deleteBuffer(offsetBuffer)
+      gl.deleteBuffer(uvBuffer)
+      gl.deleteBuffer(vertexBuffer)
       gl.deleteBuffer(indexBuffer)
       gl.deleteVertexArray(vertexArray)
       gl.deleteProgram(program)
